@@ -1,0 +1,24 @@
+[project]
+name = "global-scripts"
+version = "0.1.0"
+description = "A collection of global CLI tools including build_repo_prompt"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.12"
+dependencies = [
+    "tiktoken",
+]
+
+[project.scripts]
+build-repo-prompt = "global_scripts.build_repo_prompt:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "pyright"
+]
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
