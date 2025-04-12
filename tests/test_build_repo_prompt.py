@@ -1,10 +1,8 @@
-import os
-import tempfile
 from pathlib import Path
 
 import pytest
 
-# Import the main function from the package.
+# Import the main function and reset any global state for testing
 from global_scripts.build_repo_prompt import main
 
 @pytest.fixture
@@ -104,15 +102,16 @@ def test_complex_repo_selection(monkeypatch, complex_temp_repo):
     monkeypatch.setattr("builtins.input", lambda prompt: next(responses))
 
     # Run the main function; this should process the temporary repo.
-    main()
+    # Use specific output file in the current directory for testing
+    output_file = Path.cwd() / "repo-contents.xml"
+    main(output_file=str(output_file))
 
     # Check that the output XML file was created.
-    output_file = Path(os.getcwd()) / "repo-contents.xml"
     assert output_file.exists(), "Output XML file was not created"
 
     # Read the XML file.
     xml_content = output_file.read_text()
-    repo_name = os.path.basename(os.getcwd())
+    repo_name = Path.cwd().name
     # Check the repository name is included.
     assert f'<repo name="{repo_name}">' in xml_content, "Repo name not found in XML output"
     # Check the directory structure index exists.
@@ -136,3 +135,7 @@ def test_complex_repo_selection(monkeypatch, complex_temp_repo):
     assert "ignored1.pyc" not in xml_content, "Files ending with .pyc should be ignored"
     # Files starting with '.' (like .nit.py) are ignored.
     assert ".nit.py" not in xml_content, "Dotfiles should be ignored"
+
+    # Clean up test file
+    if output_file.exists():
+        output_file.unlink()

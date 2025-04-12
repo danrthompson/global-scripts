@@ -1,11 +1,13 @@
 import os
 import tiktoken
+from pathlib import Path
 from xml.sax.saxutils import escape
 
 # --- Configuration: Ignore rules ---
 IGNORE_DIRS = {".git", "__pycache__", ".vscode"}
 IGNORE_FILES_SUFFIX = {".pyc"}
 IGNORE_FILES_NAMES = {"repo-contents.xml", ".DS_Store"}  # Also ignore output file
+BINARY_FILE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".pdf", ".zip", ".tar", ".gz"}
 
 # --- Utility Functions ---
 
@@ -31,7 +33,7 @@ def format_size(num_bytes: int) -> str:
     return f"{num_bytes / 1024:.1f} KB"
 
 
-def prompt_choice(prompt: str, valid_choices: set) -> str:
+def prompt_choice(prompt: str, valid_choices: set[str]) -> str:
     """
     Prompt until the user inputs one of the valid choices (lowercase letters).
     Acceptable choices: e.g., {'y', 'n', 'o'}.
@@ -43,88 +45,124 @@ def prompt_choice(prompt: str, valid_choices: set) -> str:
         print(f"Invalid choice. Please enter one of {', '.join(valid_choices)}.")
 
 
-# --- Global list to accumulate selected files ---
-# Each entry is a dict with keys: 'path', 'content', 'char_count', 'token_count'
-included_files = []
+def is_probably_binary(file_path: Path) -> bool:
+    """
+    Check if a file is likely binary based on extension or content.
+    """
+    # Check file extension
+    ext = file_path.suffix.lower()
+    if ext in BINARY_FILE_EXTENSIONS:
+        return True
+
+    # Try to read a small chunk to detect binary content
+    try:
+        with file_path.open("rb") as f:
+            chunk = f.read(1024)
+            return b"\0" in chunk  # Null bytes usually indicate binary
+    except Exception:
+        return True  # If we can't read it, treat as binary to be safe
+
+    return False
+
 
 # --- Core Interactive Function ---
 
 
-def process_directory(directory: str, relative_path: str = "") -> None:
+def process_directory(
+    directory: Path, relative_path: Path = Path(""), included_files: list[dict] | None = None
+) -> list[dict]:
     """
     Recursively process a directory:
       - List files (with details) and prompt: Yes (y), No (n), or One-by-one (o).
       - Then lists subdirectories and prompts similarly.
+
+    Returns: List of included file information
     """
+    if included_files is None:
+        included_files = []
+
     try:
-        entries = os.listdir(directory)
+        entries = sorted(
+            p for p in directory.iterdir() if not (p.is_dir() and p.name in IGNORE_DIRS or p.name.startswith("."))
+        )
     except Exception as e:
         print(f"Error reading directory {directory}: {e}")
-        return
+        return included_files
 
     files = []
     dirs = []
-    for entry in sorted(entries):
-        full_path = os.path.join(directory, entry)
-        if os.path.isdir(full_path):
-            if entry in IGNORE_DIRS or entry.startswith("."):
+    for entry in entries:
+        if entry.is_dir():
+            if entry.name in IGNORE_DIRS or entry.name.startswith("."):
                 continue
             dirs.append(entry)
-        elif os.path.isfile(full_path):
+        elif entry.is_file():
             if (
-                entry in IGNORE_FILES_NAMES
-                or any(entry.endswith(suffix) for suffix in IGNORE_FILES_SUFFIX)
-                or entry.startswith(".")
+                entry.name in IGNORE_FILES_NAMES
+                or any(entry.name.endswith(suffix) for suffix in IGNORE_FILES_SUFFIX)
+                or entry.name.startswith(".")
             ):
                 continue
             files.append(entry)
 
     # --- Process Files ---
     if files:
-        print(f"\nFiles in '{relative_path or '.'}':")
+        rel_path_str = str(relative_path) or "."
+        print(f"\nFiles in '{rel_path_str}':")
         file_info_list = []
-        for file in files:
-            full_path = os.path.join(directory, file)
+        for file_path in files:
+            size_str = ""  # Initialize to handle potential missing assignment
             try:
-                size_bytes = os.path.getsize(full_path)
+                size_bytes = file_path.stat().st_size
                 size_str = format_size(size_bytes)
-                with open(full_path, "r", encoding="utf-8") as f:
+
+                # Check if file is binary
+                if is_probably_binary(file_path):
+                    print(f"  - {file_path.name}: {size_str} (binary file, will be skipped)")
+                    continue
+
+                with file_path.open("r", encoding="utf-8") as f:
                     content = f.read()
                 char_count = len(content)
                 token_count = get_token_count(content)
-            except Exception as e:
-                print(f"Error reading file {full_path}: {e}")
+            except UnicodeDecodeError:
+                print(f"  - {file_path.name}: {size_str} (binary or non-UTF-8 file, will be skipped)")
                 continue
-            print(f"  - {file}: {size_str}, {char_count} chars, ~{token_count} tokens")
-            file_info_list.append((file, content, char_count, token_count, size_str))
+            except Exception as e:
+                print(f"Error reading file {file_path}: {e}")
+                continue
+            print(f"  - {file_path.name}: {size_str}, {char_count} chars, ~{token_count} tokens")
+            file_info_list.append((file_path, content, char_count, token_count, size_str))
 
         file_choice = prompt_choice(
-            f"Include files in '{relative_path or '.'}'? (Y=all, N=none, O=one-by-one): ", {"y", "n", "o"}
+            f"Include files in '{rel_path_str}'? (Y=all, N=none, O=one-by-one): ", {"y", "n", "o"}
         )
         if file_choice == "y":
-            for file, content, char_count, token_count, _ in file_info_list:
+            for file_path, content, char_count, token_count, _ in file_info_list:
                 if char_count == 0:  # Skip empty files
                     continue
-                file_rel_path = os.path.join(relative_path, file) if relative_path else file
+                file_rel_path = relative_path / file_path.name if relative_path else Path(file_path.name)
                 included_files.append(
                     {
-                        "path": file_rel_path.replace(os.sep, "/"),
+                        "path": str(file_rel_path).replace(os.sep, "/"),
                         "content": content,
                         "char_count": char_count,
                         "token_count": token_count,
                     }
                 )
         elif file_choice == "o":
-            for file, content, char_count, token_count, size_str in file_info_list:
-                prompt_file = f"Include '{file}' ({size_str}, {char_count} chars, ~{token_count} tokens)? (y/n): "
+            for file_path, content, char_count, token_count, size_str in file_info_list:
+                prompt_file = (
+                    f"Include '{file_path.name}' ({size_str}, {char_count} chars, ~{token_count} tokens)? (y/n): "
+                )
                 sub_choice = prompt_choice(prompt_file, {"y", "n"})
                 if sub_choice == "y":
                     if char_count == 0:
                         continue
-                    file_rel_path = os.path.join(relative_path, file) if relative_path else file
+                    file_rel_path = relative_path / file_path.name if relative_path else Path(file_path.name)
                     included_files.append(
                         {
-                            "path": file_rel_path.replace(os.sep, "/"),
+                            "path": str(file_rel_path).replace(os.sep, "/"),
                             "content": content,
                             "char_count": char_count,
                             "token_count": token_count,
@@ -134,34 +172,42 @@ def process_directory(directory: str, relative_path: str = "") -> None:
 
     # --- Process Directories ---
     if dirs:
-        print(f"\nDirectories in '{relative_path or '.'}':")
-        for dir_name in dirs:
-            print(f"  - {dir_name}")
+        rel_path_str = str(relative_path) or "."
+        print(f"\nDirectories in '{rel_path_str}':")
+        for dir_path in dirs:
+            print(f"  - {dir_path.name}")
         dir_choice = prompt_choice(
-            f"Include directories in '{relative_path or '.'}'? (Y=all, N=none, O=one-by-one): ", {"y", "n", "o"}
+            f"Include directories in '{rel_path_str}'? (Y=all, N=none, O=one-by-one): ", {"y", "n", "o"}
         )
         if dir_choice == "y":
-            for dir_name in dirs:
-                new_rel_path = os.path.join(relative_path, dir_name) if relative_path else dir_name
-                process_directory(os.path.join(directory, dir_name), new_rel_path)
+            for dir_path in dirs:
+                new_rel_path = relative_path / dir_path.name if relative_path else Path(dir_path.name)
+                process_directory(dir_path, new_rel_path, included_files)
         elif dir_choice == "o":
-            for dir_name in dirs:
-                sub_choice = prompt_choice(f"Include directory '{dir_name}'? (y/n): ", {"y", "n"})
+            for dir_path in dirs:
+                sub_choice = prompt_choice(f"Include directory '{dir_path.name}'? (y/n): ", {"y", "n"})
                 if sub_choice == "y":
-                    new_rel_path = os.path.join(relative_path, dir_name) if relative_path else dir_name
-                    process_directory(os.path.join(directory, dir_name), new_rel_path)
+                    new_rel_path = relative_path / dir_path.name if relative_path else Path(dir_path.name)
+                    process_directory(dir_path, new_rel_path, included_files)
         # 'n' leads to skipping directories
+
+    return included_files
 
 
 # --- XML Generation ---
 
 
-def generate_xml() -> str:
+def generate_xml(included_files: list[dict], repo_name: str | None = None) -> str:
     """
     Generate an XML representation of the selected files.
     """
-    # Use the current directory's name as the repository name.
-    repo_name = os.path.basename(os.getcwd())
+    # Use the current directory's name as the repository name if not provided
+    if repo_name is None:
+        repo_name = Path.cwd().name
+
+    # Escape XML special characters in the repo name
+    repo_name = escape(repo_name)
+
     xml_lines = []
     xml_lines.append(f'<repo name="{repo_name}">')
 
@@ -173,8 +219,9 @@ def generate_xml() -> str:
 
     # File entries with XML-escaped content.
     for file_info in included_files:
+        escaped_path = escape(file_info["path"])
         escaped_content = escape(file_info["content"])
-        xml_lines.append(f'  <file path="{file_info["path"]}">')
+        xml_lines.append(f'  <file path="{escaped_path}">')
         xml_lines.append(f"    {escaped_content}")
         xml_lines.append("  </file>\n")
     xml_lines.append("</repo>")
@@ -185,15 +232,20 @@ def generate_xml() -> str:
 # --- CLI Entry Point ---
 
 
-def main() -> None:
+def main(output_file: str = "repo-contents.xml", start_dir: str | None = None) -> None:
     """
     Entry point for the 'build-repo-prompt' CLI tool.
+
+    Args:
+        output_file: Name of the output XML file
+        start_dir: Directory to start processing from (defaults to current directory)
     """
     print("Interactive Repository XML Builder")
     print("====================================")
 
-    # Begin processing at the current working directory.
-    process_directory(os.getcwd(), "")
+    # Begin processing at the specified directory or current working directory
+    start_directory = Path(start_dir) if start_dir else Path.cwd()
+    included_files = process_directory(start_directory)
 
     # Show summary totals.
     total_chars = sum(f["char_count"] for f in included_files)
@@ -204,12 +256,16 @@ def main() -> None:
     print(f"  Total tokens: {total_tokens}")
 
     # Generate and write XML output.
-    xml_content = generate_xml()
-    output_file = "repo-contents.xml"
+    xml_content = generate_xml(included_files)
     try:
-        with open(output_file, "w", encoding="utf-8") as f:
+        # Create output path
+        output_path = Path(output_file)
+        if not output_path.is_absolute():
+            output_path = start_directory / output_path
+
+        with output_path.open("w", encoding="utf-8") as f:
             f.write(xml_content)
-        print(f"\nXML output written to '{output_file}'.")
+        print(f"\nXML output written to '{output_path}'.")
     except Exception as e:
         print(f"Error writing XML file: {e}")
 
